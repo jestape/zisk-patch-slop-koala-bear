@@ -1,3 +1,6 @@
+// Modified for ZisK: inside a ZisK guest, `KoalaPerm` runs the permutation on the ZisK
+// `poseidon2_koalabear` precompile. See this crate's README.
+
 use std::array::from_fn;
 
 use crate::{DiffusionMatrixKoalaBear, KoalaBear};
@@ -6,7 +9,9 @@ use serde::{Deserialize, Serialize};
 use slop_algebra::{extension::BinomialExtensionField, AbstractField};
 use slop_challenger::{DuplexChallenger, IopCtx};
 use slop_poseidon2::{Poseidon2, Poseidon2ExternalMatrixGeneral};
-use slop_symmetric::{PaddingFreeSponge, TruncatedPermutation};
+use slop_symmetric::{
+    CryptographicPermutation, PaddingFreeSponge, Permutation, TruncatedPermutation,
+};
 
 pub(crate) fn string_to_koala_bear(hex_string: String) -> KoalaBear {
     KoalaBear::from_canonical_u64(
@@ -17,8 +22,53 @@ pub(crate) fn string_to_koala_bear(hex_string: String) -> KoalaBear {
 #[derive(Debug, Clone, Default, Copy, Serialize, Deserialize, Hash, PartialEq, Eq)]
 pub struct Poseidon2KoalaBearConfig<const STATE_WIDTH: usize = 16>;
 
-pub type KoalaPerm =
+pub type KoalaPoseidon2 =
     Poseidon2<KoalaBear, Poseidon2ExternalMatrixGeneral, DiffusionMatrixKoalaBear, 16, 3>;
+
+/// `my_kb_16_perm`, run on the ZisK `poseidon2_koalabear` precompile inside ZisK.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct KoalaPerm(pub KoalaPoseidon2);
+
+#[cfg(all(target_os = "zkvm", target_vendor = "zisk"))]
+extern "C" {
+    fn syscall_poseidon2_koalabear(state: *mut [u64; 8]);
+}
+
+// The precompile call below reinterprets the state as eight `u64`s.
+const _: () = assert!(core::mem::size_of::<[KoalaBear; 16]>() == core::mem::size_of::<[u64; 8]>());
+
+#[cfg(all(target_os = "zkvm", target_vendor = "zisk"))]
+impl Permutation<[KoalaBear; 16]> for KoalaPerm {
+    fn permute_mut(&self, state: &mut [KoalaBear; 16]) {
+        unsafe {
+            // KoalaBear is a repr(transparent) u32 in Montgomery form, which is what the precompile
+            // takes: the sixteen lanes are its eight little-endian words.
+            let mut words: [u64; 8] = core::mem::transmute(*state);
+            syscall_poseidon2_koalabear(&mut words);
+            *state = core::mem::transmute(words);
+        }
+    }
+}
+
+#[cfg(all(target_os = "zkvm", target_vendor = "zisk"))]
+impl CryptographicPermutation<[KoalaBear; 16]> for KoalaPerm {}
+
+// Outside ZisK, every state the software permutation takes, such as packed fields for the prover.
+#[cfg(not(all(target_os = "zkvm", target_vendor = "zisk")))]
+impl<T: Clone> Permutation<[T; 16]> for KoalaPerm
+where
+    KoalaPoseidon2: Permutation<[T; 16]>,
+{
+    fn permute_mut(&self, state: &mut [T; 16]) {
+        self.0.permute_mut(state);
+    }
+}
+
+#[cfg(not(all(target_os = "zkvm", target_vendor = "zisk")))]
+impl<T: Clone> CryptographicPermutation<[T; 16]> for KoalaPerm where
+    KoalaPoseidon2: CryptographicPermutation<[T; 16]>
+{
+}
 
 #[derive(Clone, Serialize, Deserialize, Eq, PartialEq, Debug, Default)]
 pub struct KoalaBearDegree4Duplex;
@@ -34,25 +84,25 @@ impl IopCtx for KoalaBearDegree4Duplex {
     type Compressor = TruncatedPermutation<KoalaPerm, 2, 8, 16>;
 
     fn default_hasher_and_compressor() -> (Self::Hasher, Self::Compressor) {
-        let perm = my_kb_16_perm();
+        let perm = KoalaPerm(my_kb_16_perm());
         let hasher = Self::Hasher::new(perm.clone());
         let compressor = Self::Compressor::new(perm.clone());
         (hasher, compressor)
     }
 
     fn default_challenger() -> Self::Challenger {
-        DuplexChallenger::new(my_kb_16_perm())
+        DuplexChallenger::new(KoalaPerm(my_kb_16_perm()))
     }
 }
 
-pub fn my_kb_16_perm() -> KoalaPerm {
+pub fn my_kb_16_perm() -> KoalaPoseidon2 {
     const ROUNDS_F: usize = 8;
     const ROUNDS_P: usize = 20;
     let mut external_round_constants = KoalaBear_BEGIN_EXT_CONSTS.to_vec();
     let internal_round_constants = KoalaBear_PARTIAL_CONSTS.to_vec();
     external_round_constants.extend_from_slice(KoalaBear_END_EXT_CONSTS.as_slice());
 
-    KoalaPerm::new(
+    KoalaPoseidon2::new(
         ROUNDS_F,
         external_round_constants,
         Poseidon2ExternalMatrixGeneral,

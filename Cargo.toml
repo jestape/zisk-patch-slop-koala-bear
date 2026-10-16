@@ -70,4 +70,5 @@ check-cfg = [
     "cfg(sp1_use_native_executor)",
     "cfg(sp1_use_portable_executor)",
     "cfg(sp1_native_executor_available)",
+    'cfg(target_vendor, values("zisk"))',
 ]
